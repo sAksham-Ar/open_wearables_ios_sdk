@@ -14,6 +14,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("HealthKit"),
                 .linkedFramework("BackgroundTasks"),
+                .linkedFramework("CoreLocation"),
             ]
         ),
         .testTarget(

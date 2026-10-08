@@ -704,8 +704,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        let readTypes = Set(getQueryableTypes())
-        logMessage("Requesting read-only auth for \(readTypes.count) types")
+        var readTypes = Set(getQueryableTypes())
+        readTypes.insert(HKSeriesType.workoutRoute())
+        logMessage("Requesting read-only auth for \(readTypes.count) types (including workoutRoute)")
         
         healthStore.requestAuthorization(toShare: nil, read: readTypes) { ok, _ in
             DispatchQueue.main.async { completion(ok) }

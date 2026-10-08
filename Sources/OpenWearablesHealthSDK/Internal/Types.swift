@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import CoreLocation
 
 // MARK: - Public Health Data Type Enum
 
@@ -667,12 +668,71 @@ extension OpenWearablesHealthSDK {
             "values": stats,
             "segments": NSNull(),
             "laps": _buildWorkoutLaps(w, dateFormatter: dateFormatter),
-            "route": NSNull(),
+            "route": _buildWorkoutRoute(w, dateFormatter: dateFormatter),
             "samples": NSNull(),
             "metadata": NSNull()
         ]
     }
     
+    // MARK: - Workout route
+
+    /// Maps HealthKit workout route coordinates and elevation into the payload `route` array.
+    /// Returns `NSNull()` when the workout has no route points or query times out.
+    internal func _buildWorkoutRoute(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> Any {
+        let semaphore = DispatchSemaphore(value: 0)
+        var routePoints: [[String: Any]] = []
+        
+        let predicate = HKQuery.predicateForObjects(from: w)
+        let routeQuery = HKSampleQuery(
+            sampleType: HKSeriesType.workoutRoute(),
+            predicate: predicate,
+            limit: HKObjectQueryNoLimit,
+            sortDescriptors: nil
+        ) { (query, samples, error) in
+            guard let routes = samples as? [HKWorkoutRoute], !routes.isEmpty else {
+                semaphore.signal()
+                return
+            }
+            
+            let routeGroup = DispatchGroup()
+            for route in routes {
+                routeGroup.enter()
+                let locationQuery = HKWorkoutRouteQuery(route: route) { (locQuery, locationsOrNil, done, locError) in
+                    if let locations = locationsOrNil {
+                        for loc in locations {
+                            var point: [String: Any] = [
+                                "timestamp": dateFormatter.string(from: loc.timestamp),
+                                "latitude": loc.coordinate.latitude,
+                                "longitude": loc.coordinate.longitude,
+                                "altitudeM": loc.altitude,
+                                "horizontalAccuracyM": loc.horizontalAccuracy,
+                            ]
+                            if loc.verticalAccuracy >= 0 {
+                                point["verticalAccuracyM"] = loc.verticalAccuracy
+                            } else {
+                                point["verticalAccuracyM"] = NSNull()
+                            }
+                            routePoints.append(point)
+                        }
+                    }
+                    if done {
+                        routeGroup.leave()
+                    }
+                }
+                OpenWearablesHealthSDK.shared.healthStore.execute(locationQuery)
+            }
+            
+            routeGroup.notify(queue: DispatchQueue.global()) {
+                semaphore.signal()
+            }
+        }
+        
+        OpenWearablesHealthSDK.shared.healthStore.execute(routeQuery)
+        _ = semaphore.wait(timeout: .now() + 5.0)
+        
+        return routePoints.isEmpty ? NSNull() : routePoints
+    }
+
     // MARK: - Workout laps / events
 
     /// Maps HealthKit workout events (lap / segment / marker) into the payload `laps` array.
