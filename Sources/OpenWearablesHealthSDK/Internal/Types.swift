@@ -219,12 +219,12 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.workoutType()
         case .workoutEffortScore:
             if #available(iOS 18.0, watchOS 11.0, *) {
-                return HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
+                return HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: "HKQuantityTypeIdentifierWorkoutEffortScore"))
             }
             return nil
         case .estimatedWorkoutEffortScore:
             if #available(iOS 18.0, watchOS 11.0, *) {
-                return HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore)
+                return HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: "HKQuantityTypeIdentifierEstimatedWorkoutEffortScore"))
             }
             return nil
         }
@@ -364,9 +364,9 @@ extension OpenWearablesHealthSDK {
                 }
             }
             if #available(iOS 18.0, *) {
-                if qt == HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
-                    || qt == HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore) {
-                    return .appleEffortScore()
+                if qt == HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: "HKQuantityTypeIdentifierWorkoutEffortScore"))
+                    || qt == HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: "HKQuantityTypeIdentifierEstimatedWorkoutEffortScore")) {
+                    return HKUnit(from: "appleEffortScore")
                 }
             }
             return .count()
@@ -463,9 +463,9 @@ extension OpenWearablesHealthSDK {
                 }
             }
             if #available(iOS 18.0, *) {
-                if qt == HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
-                    || qt == HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore) {
-                    return (.appleEffortScore(), "appleEffortScore")
+                if qt == HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: "HKQuantityTypeIdentifierWorkoutEffortScore"))
+                    || qt == HKObjectType.quantityType(forIdentifier: HKQuantityTypeIdentifier(rawValue: "HKQuantityTypeIdentifierEstimatedWorkoutEffortScore")) {
+                    return (HKUnit(from: "appleEffortScore"), "appleEffortScore")
                 }
             }
             return (.count(), "count")
