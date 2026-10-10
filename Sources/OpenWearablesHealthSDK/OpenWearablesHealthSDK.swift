@@ -1070,52 +1070,69 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
-            let payload = self.buildCombinedPayload(samples: allSamples)
-            
-            self.uploadCombinedPayload(
-                payload: payload, endpoint: endpoint, credential: freshCredential,
-                generation: rrState.generation
-            ) { [weak self] sendSuccess in
+            let continueWithPayload: ([UUID: [[String: Any]]]?) -> Void = { [weak self] routesByWorkoutId in
                 guard let self = self else { completion(false); return }
-                if !sendSuccess { completion(false); return }
                 if self.isSyncCancelled(generation: rrState.generation) {
                     completion(false)
                     return
                 }
                 
-                // Phase 3: Update progress for all types that had data
-                for result in withData {
-                    if fullExport {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
-                        )
-                    } else {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: result.isDone, anchorData: result.anchorData
-                        )
-                        if result.isDone {
-                            rrState.completedTypes.insert(result.type.identifier)
+                let payload = self.buildCombinedPayload(samples: allSamples, routesByWorkoutId: routesByWorkoutId)
+                
+                self.uploadCombinedPayload(
+                    payload: payload, endpoint: endpoint, credential: freshCredential,
+                    generation: rrState.generation
+                ) { [weak self] sendSuccess in
+                    guard let self = self else { completion(false); return }
+                    if !sendSuccess { completion(false); return }
+                    if self.isSyncCancelled(generation: rrState.generation) {
+                        completion(false)
+                        return
+                    }
+                    
+                    // Phase 3: Update progress for all types that had data
+                    for result in withData {
+                        if fullExport {
+                            self.updateTypeProgress(
+                                typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                            )
+                        } else {
+                            self.updateTypeProgress(
+                                typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                isComplete: result.isDone, anchorData: result.anchorData
+                            )
+                            if result.isDone {
+                                rrState.completedTypes.insert(result.type.identifier)
+                            }
                         }
                     }
-                }
-                
-                // Phase 4: For full export, capture anchors for done types
-                let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
-                if fullExport && !fullExportDone.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
-                        guard captureOk else { completion(false); return }
+                    
+                    // Phase 4: For full export, capture anchors for done types
+                    let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
+                    if fullExport && !fullExportDone.isEmpty {
+                        self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
+                            guard captureOk else { completion(false); return }
+                            self.processNextRound(
+                                types: types, fullExport: fullExport, endpoint: endpoint,
+                                rrState: rrState, completion: completion
+                            )
+                        }
+                    } else {
                         self.processNextRound(
                             types: types, fullExport: fullExport, endpoint: endpoint,
                             rrState: rrState, completion: completion
                         )
                     }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        rrState: rrState, completion: completion
-                    )
+                }
+            }
+            
+            let workouts = allSamples.compactMap { $0 as? HKWorkout }
+            if workouts.isEmpty {
+                continueWithPayload(nil)
+            } else {
+                self.fetchWorkoutRoutes(for: workouts) { routes in
+                    continueWithPayload(routes)
                 }
             }
         }
@@ -1320,6 +1337,128 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         healthStore.execute(query)
     }
+
+    // MARK: - Workout Route Pre-fetching (Asynchronous, Non-blocking)
+
+    private func fetchWorkoutRoutes(
+        for workouts: [HKWorkout],
+        completion: @escaping ([UUID: [[String: Any]]]) -> Void
+    ) {
+        guard !workouts.isEmpty else {
+            completion([:])
+            return
+        }
+        
+        let dispatchGroup = DispatchGroup()
+        let lock = NSLock()
+        var routesByWorkoutId: [UUID: [[String: Any]]] = [:]
+        
+        var hasCompleted = false
+        let completionLock = NSLock()
+        let callCompletionOnce: ([UUID: [[String: Any]]]) -> Void = { result in
+            completionLock.lock()
+            guard !hasCompleted else {
+                completionLock.unlock()
+                return
+            }
+            hasCompleted = true
+            completionLock.unlock()
+            completion(result)
+        }
+        
+        for workout in workouts {
+            dispatchGroup.enter()
+            let workoutDateFormatter = ISO8601DateFormatter()
+            let predicate = HKQuery.predicateForObjects(from: workout)
+            let routeQuery = HKSampleQuery(
+                sampleType: HKSeriesType.workoutRoute(),
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { [weak self] _, samples, error in
+                guard let self = self, error == nil, let routes = samples as? [HKWorkoutRoute], !routes.isEmpty else {
+                    dispatchGroup.leave()
+                    return
+                }
+                
+                let workoutGroup = DispatchGroup()
+                var workoutPoints: [[String: Any]] = []
+                let workoutLock = NSLock()
+                
+                for route in routes {
+                    workoutGroup.enter()
+                    var hasLeft = false
+                    let locationQuery = HKWorkoutRouteQuery(route: route) { _, locationsOrNil, done, locError in
+                        if let locations = locationsOrNil {
+                            var batchPoints: [[String: Any]] = []
+                            for loc in locations {
+                                var point: [String: Any] = [
+                                    "timestamp": workoutDateFormatter.string(from: loc.timestamp),
+                                    "latitude": loc.coordinate.latitude,
+                                    "longitude": loc.coordinate.longitude,
+                                    "altitudeM": loc.altitude,
+                                    "horizontalAccuracyM": loc.horizontalAccuracy,
+                                ]
+                                if loc.verticalAccuracy >= 0 {
+                                    point["verticalAccuracyM"] = loc.verticalAccuracy
+                                } else {
+                                    point["verticalAccuracyM"] = NSNull()
+                                }
+                                batchPoints.append(point)
+                            }
+                            workoutLock.lock()
+                            workoutPoints.append(contentsOf: batchPoints)
+                            workoutLock.unlock()
+                        }
+                        
+                        if done || locError != nil {
+                            workoutLock.lock()
+                            if !hasLeft {
+                                hasLeft = true
+                                workoutLock.unlock()
+                                workoutGroup.leave()
+                            } else {
+                                workoutLock.unlock()
+                            }
+                        }
+                    }
+                    self.healthStore.execute(locationQuery)
+                }
+                
+                workoutGroup.notify(queue: DispatchQueue.global()) {
+                    workoutLock.lock()
+                    let finalPoints = workoutPoints
+                    workoutLock.unlock()
+                    
+                    if !finalPoints.isEmpty {
+                        lock.lock()
+                        routesByWorkoutId[workout.uuid] = finalPoints
+                        lock.unlock()
+                    }
+                    dispatchGroup.leave()
+                }
+            }
+            healthStore.execute(routeQuery)
+        }
+        
+        let timeoutWorkItem = DispatchWorkItem {
+            lock.lock()
+            let partial = routesByWorkoutId
+            lock.unlock()
+            callCompletionOnce(partial)
+        }
+        
+        dispatchGroup.notify(queue: DispatchQueue.global()) {
+            timeoutWorkItem.cancel()
+            lock.lock()
+            let final = routesByWorkoutId
+            lock.unlock()
+            callCompletionOnce(final)
+        }
+        
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15.0, execute: timeoutWorkItem)
+    }
+
     
     // MARK: - Anchor Capture (for incremental sync after full export)
     

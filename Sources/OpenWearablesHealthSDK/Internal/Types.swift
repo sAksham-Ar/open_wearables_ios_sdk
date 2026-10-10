@@ -241,7 +241,10 @@ extension OpenWearablesHealthSDK {
     /// handed to `JSONSerialization` in one piece, so peak memory scales with the round.
     /// It is bounded by the round size instead - background rounds carry 100 records
     /// (~65 KB), and the 2000-record rounds only run in the foreground.
-    internal func buildCombinedPayload(samples: [HKSample]) -> [String: Any] {
+    internal func buildCombinedPayload(
+        samples: [HKSample],
+        routesByWorkoutId: [UUID: [[String: Any]]]? = nil
+    ) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -256,7 +259,8 @@ extension OpenWearablesHealthSDK {
                 
                 for s in batch {
                     if let w = s as? HKWorkout {
-                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter))
+                        let routePoints = routesByWorkoutId?[w.uuid]
+                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter, routePoints: routePoints))
                     } else if let q = s as? HKQuantitySample {
                         records.append(_mapQuantityEfficient(q, dateFormatter: dateFormatter))
                     } else if let c = s as? HKCategorySample {
@@ -652,8 +656,18 @@ extension OpenWearablesHealthSDK {
         return records
     }
 
-    private func _mapWorkoutEfficient(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> [String: Any] {
+    private func _mapWorkoutEfficient(
+        _ w: HKWorkout,
+        dateFormatter: ISO8601DateFormatter,
+        routePoints: [[String: Any]]? = nil
+    ) -> [String: Any] {
         let stats = _buildWorkoutStats(w)
+        let routeValue: Any
+        if let routePoints = routePoints, !routePoints.isEmpty {
+            routeValue = routePoints
+        } else {
+            routeValue = NSNull()
+        }
 
         return [
             "id": w.uuid.uuidString,
@@ -668,69 +682,10 @@ extension OpenWearablesHealthSDK {
             "values": stats,
             "segments": NSNull(),
             "laps": _buildWorkoutLaps(w, dateFormatter: dateFormatter),
-            "route": _buildWorkoutRoute(w, dateFormatter: dateFormatter),
+            "route": routeValue,
             "samples": NSNull(),
             "metadata": NSNull()
         ]
-    }
-    
-    // MARK: - Workout route
-
-    /// Maps HealthKit workout route coordinates and elevation into the payload `route` array.
-    /// Returns `NSNull()` when the workout has no route points or query times out.
-    internal func _buildWorkoutRoute(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> Any {
-        let semaphore = DispatchSemaphore(value: 0)
-        var routePoints: [[String: Any]] = []
-        
-        let predicate = HKQuery.predicateForObjects(from: w)
-        let routeQuery = HKSampleQuery(
-            sampleType: HKSeriesType.workoutRoute(),
-            predicate: predicate,
-            limit: HKObjectQueryNoLimit,
-            sortDescriptors: nil
-        ) { (query, samples, error) in
-            guard let routes = samples as? [HKWorkoutRoute], !routes.isEmpty else {
-                semaphore.signal()
-                return
-            }
-            
-            let routeGroup = DispatchGroup()
-            for route in routes {
-                routeGroup.enter()
-                let locationQuery = HKWorkoutRouteQuery(route: route) { (locQuery, locationsOrNil, done, locError) in
-                    if let locations = locationsOrNil {
-                        for loc in locations {
-                            var point: [String: Any] = [
-                                "timestamp": dateFormatter.string(from: loc.timestamp),
-                                "latitude": loc.coordinate.latitude,
-                                "longitude": loc.coordinate.longitude,
-                                "altitudeM": loc.altitude,
-                                "horizontalAccuracyM": loc.horizontalAccuracy,
-                            ]
-                            if loc.verticalAccuracy >= 0 {
-                                point["verticalAccuracyM"] = loc.verticalAccuracy
-                            } else {
-                                point["verticalAccuracyM"] = NSNull()
-                            }
-                            routePoints.append(point)
-                        }
-                    }
-                    if done {
-                        routeGroup.leave()
-                    }
-                }
-                OpenWearablesHealthSDK.shared.healthStore.execute(locationQuery)
-            }
-            
-            routeGroup.notify(queue: DispatchQueue.global()) {
-                semaphore.signal()
-            }
-        }
-        
-        OpenWearablesHealthSDK.shared.healthStore.execute(routeQuery)
-        _ = semaphore.wait(timeout: .now() + 5.0)
-        
-        return routePoints.isEmpty ? NSNull() : routePoints
     }
 
     // MARK: - Workout laps / events
